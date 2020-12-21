@@ -162,7 +162,7 @@ class CODASReader:
     # to all values and saved or whether it is simply stored once to
     # then manually be applied later
     def readADC(self, channels=None, start_time=0, end_time=None,
-                save_memory=True):
+                save_memory=True, az_time=True):
         """PARAMETERS: \n
         channels : int or array-like of int, optional \n
             Must be able to be converted into a numpy array. \n
@@ -179,13 +179,21 @@ class CODASReader:
             Time in seconds since start of data acquesition at which
             the last ADC data should be read. \n
             Default is until end of ADC data section in file. \n
-        save_memory : bool \n
+        save_memory : bool, optional \n
             Decides whether the scaling factor is applied to the data
-            before it is saved to the array \n
             or if the scaling factor is saved in a separate array \n
+            before it is saved to the array \n
+            If true, the data will be saved as int16, which is the
+            way it is natively stored in the file
+            (no loss of information) \n
+            If false, the data is stored as float. \n
             Default is True \n
             It is recommended to use save_memory = True for large files
             and / or for systems with limited ram. \n
+        az_time: bool, optional \n
+            Decides whether the time stamps are in UTC or in
+            Arizona local time (VERITAS telescope location) \n
+            Default is True (Arizona time) \n
         \n Use 'printAcqTime' and 'printFinishTime' to get start and
         finish time of the data acquesition respectively
         \n The header of the file must be read before
@@ -235,6 +243,12 @@ class CODASReader:
         else:
             self.adc_data = np.empty([int(end_byte / (2 * self.acq_channels)),
                                       len(channels)])
+        # applying a 7 hour offset if az_time is True to account for
+        # the 7 hour difference between arizona time and UTC
+        if az_time:
+            offset = -3600 * 7
+        else:
+            offset = 0
         # setting up arrays to store the time stamps and the scaling
         # factor for each channel.
         # these are stored separately to increase memory efficiency on
@@ -280,12 +294,12 @@ class CODASReader:
             # self.header[13] stores time of start of measurement,
             # self.header[12] stores time between measurements
             self.adc_time_stamps[i, 0] = (time.strftime(
-                "%d/%m/%Y", time.gmtime(self.header[13] + start_time + i
-                                        * self.header[12])))
+                "%m-%d-%Y", time.gmtime(self.header[13] + start_time + i
+                                        * self.header[12] + offset)))
             self.adc_time_stamps[i, 1] = (time.strftime(
                 "%H:%M:%S", time.gmtime(self.header[13] + start_time + i
-                                        * self.header[12])))
-            self.adc_time_stamps[i, 2] = (i * self.header[12])
+                                        * self.header[12] + offset)))
+            self.adc_time_stamps[i, 2] = "{:.4f}".format(i * self.header[12])
         # if save_memory is set to true, scaling factors will be saved
         # in a separate list
         if save_memory:
@@ -326,6 +340,11 @@ class CODASReader:
         for i in range(int(self.header[6] / 4)):
             if marker:
                 trailer_item = [struct.unpack("<l", bin_data.read(4))[0]]
+                trailer_item[-1] = (np.abs(trailer_item[-1]) * 2
+                                    * channels_hiRes) + self.header[4]
+                trailer_item[-1] = (int((trailer_item[-1] - self.header[4])
+                                        / (2 * self.acq_channels))
+                                    * self.header[12])
                 marker = False
                 # determine whether or not next long will be
                 # time and date stamp or not
@@ -333,6 +352,7 @@ class CODASReader:
                     time_stamp = True
             elif time_stamp:
                 trailer_item.append(struct.unpack("<l", bin_data.read(4))[0])
+                trailer_item[-1] = trailer_item[-1] + self.header[13]
                 time_stamp = False
             else:
                 # determine whether next long is comment pointer
@@ -340,10 +360,16 @@ class CODASReader:
                 trailer_long = struct.unpack("<l", bin_data.read(4))[0]
                 if trailer_long > -1 * self.header[5] / (2 * channels_hiRes):
                     trailer_pointers.append(trailer_item)
+                    trailer_long = (np.abs(trailer_long) * 2
+                                    * channels_hiRes) + self.header[4]
+                    trailer_long = (int((trailer_long - self.header[4])
+                                        / (2 * self.acq_channels))
+                                    * self.header[12])
                     trailer_item = [trailer_long]
                     if trailer_item[-1] >= 0:
                         time_stamp = True
                 else:
+                    trailer_long = (trailer_long & 2147483647) - self.header[7]
                     trailer_item.append(trailer_long)
                     trailer_pointers.append(trailer_item)
                     marker = True
@@ -375,19 +401,18 @@ class CODASReader:
         # event marker comment part of the trailer,
         # code works similiarly to user annotation above
         trailer_item = ""
-        trailer_comments_list = []
-        # trailer_comments = bin_data.read()
+        trailer_comments_dict = {}
         for i in range(self.bytes_in_file - (self.header[4]
                                              + self.adc_data_bytes
                                              + self.header[6]
                                              + self.header[7])):
             trailer_byte = struct.unpack("<b", bin_data.read(1))[0]
             if int(trailer_byte) == 0:
-                trailer_comments_list.append(trailer_item)
+                trailer_comments_dict[i - len(trailer_item)] = (trailer_item)
                 trailer_item = ""
             else:
                 trailer_item = trailer_item + chr(int(trailer_byte))
-        self.trailer.append(trailer_comments_list)
+        self.trailer.append(trailer_comments_dict)
 
         bin_data.close()
 
@@ -422,15 +447,14 @@ class CODASReader:
         print("Fixed value of 8001H: " + str(self.header[-1]))
 
     # saves the adc data to a file with name 'name'
-    def saveADCsToCSV(self, name, delim=",", fmt="%s", header=[]):
+    def saveADCsToCSV(self, name, delim=",", header=[]):
         """param name : str \n
         param delim : str, optional \n
-        param fmt : str, optional \n
         param header : list, optional \n
         Saves the ADC data of the file to a CSV file of name 'name'. \n
         First line of the file will be the header if any is given,
         otherwise it will be empty. \n
-        The second line will be the channel number corresponding to 
+        The second line will be the channel number corresponding to
         the channel that recorded the data in the column below. \n
         The third line will be the scaling factor for each channel
         in the column of the respective channel data."""
@@ -439,12 +463,14 @@ class CODASReader:
         # memory
         with open(name, "w", newline="\n") as file:
             # writing header at the top of the file if a header is given
+            file.write("#")
             for item in header:
                 file.write(str(item))
                 file.write(delim)
             file.write("\n")
             # writing channel number for each column at the top of each
             # column
+            file.write("#")
             file.write(delim)
             for item in self.channels:
                 file.write(str(item))
@@ -454,6 +480,7 @@ class CODASReader:
             # scaling information for each channel will be the second
             # item in the column corresponding to that channel after
             # the channel number
+            file.write("#")
             file.write(delim)
             for item in self.adc_scaling:
                 file.write(str(item))
@@ -469,7 +496,6 @@ class CODASReader:
                 file.write(str(self.adc_time_stamps[i][0]))
                 file.write(delim)
                 file.write(str(self.adc_time_stamps[i][1]))
-                file.write(delim)
                 file.write("\n")
 
     # printing the trailer element of the file
@@ -477,13 +503,19 @@ class CODASReader:
         """Prints the trailer of the file"""
         print("Event marker pointers: ")
         for item in self.trailer[0]:
-            print(item)
+            print("Event marked at " + "{:.4f}".format(item[0])
+                  + " seconds since start of data acquesition")
+            print("Marker created at "
+                  + time.strftime("%m-%d-%Y, %H:%M:%S", time.gmtime(item[1]))
+                  + " (UTC)")
+            try:
+                print("Marker comment: " + self.trailer[2][item[2]])
+            except:
+                pass
+            print("")
         print("User annotations")
         for i, item in enumerate(self.trailer[1]):
             print("Channel No. " + str(i) + " annotation: " + str(item))
-        print("Event marker comments: ")
-        for item in self.trailer[2]:
-            print(item)
 
     # print total length of header in bytes (stored in header[4])
     def printHeaderLength(self):
@@ -497,18 +529,34 @@ class CODASReader:
 
     # print time and date of start of data acquesition in GMT
     # (stored in header[13])
-    def printAcqTime(self):
+    def printAcqTime(self, az_time=True):
         """Prints time and date of start of
-        data acquesition"""
+        data acquesition \n
+        param az_time: bool, optional \n
+            Switches between Arizona time and UTC (default: Arizona time)"""
+        # applying a 7 hour offset if az_time is True to account for
+        # the 7 hour difference between arizona time and UTC
+        if az_time:
+            offset = -3600 * 7
+        else:
+            offset = 0
         print(time.strftime("%d %b %Y , %H:%M:%S",
-                            time.gmtime(self.header[13])))
+                            time.gmtime(self.header[13] + offset)))
 
     # print time and date at which the data acquesition was finished
     # (stored in header[14])
-    def printFinishTime(self):
-        """"Prints time and date of end of data acquesition"""
+    def printFinishTime(self, az_time=True):
+        """"Prints time and date of end of data acquesition \n
+        param az_time: bool, optional \n
+            Switches between Arizona time and UTC (default: Arizona time)"""
+        # applying a 7 hour offset if az_time is True to account for
+        # the 7 hour difference between arizona time and UTC
+        if az_time:
+            offset = -3600 * 7
+        else:
+            offset = 0
         print(time.strftime("%d %b %Y , %H:%M:%S",
-                            time.gmtime(self.header[14])))
+                            time.gmtime(self.header[14] + offset)))
 
     # print total time in seconds over which the data acquesition took
     # place (1s accuracy)
@@ -564,17 +612,33 @@ class CODASReader:
 
     # return time and date of start of data acquesition in GMT
     # (stored in header[13])
-    def getAcqTime(self):
-        """Returns time and date of start of data acquesition"""
+    def getAcqTime(self, az_time=True):
+        """Returns time and date of start of data acquesition \n
+        param az_time: bool, optional \n
+            Switches between Arizona time and UTC (default: Arizona time)"""
+        # applying a 7 hour offset if az_time is True to account for
+        # the 7 hour difference between arizona time and UTC
+        if az_time:
+            offset = -3600 * 7
+        else:
+            offset = 0
         return time.strftime("%d %b %Y , %H:%M:%S",
-                             time.gmtime(self.header[13]))
+                             time.gmtime(self.header[13] + offset))
 
     # return time and date at which the data acquesition was finished
     # (stored in header[14])
-    def getFinishTime(self):
-        """"Returns time and date of end of data acquesition"""
+    def getFinishTime(self, az_time=True):
+        """"Returns time and date of end of data acquesition \n
+        param az_time: bool, optional \n
+            Switches between Arizona time and UTC (default: Arizona time)"""
+        # applying a 7 hour offset if az_time is True to account for
+        # the 7 hour difference between arizona time and UTC
+        if az_time:
+            offset = -3600 * 7
+        else:
+            offset = 0
         return time.strftime("%d %b %Y , %H:%M:%S",
-                             time.gmtime(self.header[14]))
+                             time.gmtime(self.header[14] + offset))
 
     # return total time in seconds over which the data acquesition took
     # place (1s accuracy)
@@ -691,7 +755,7 @@ if __name__ == "__main__":
         try:
             # read and print ADC data with appropriate options
             codas_reader.readADC(channels=channels, start_time=start_time,
-                                end_time=end_time)
+                                 end_time=end_time)
             codas_reader.saveADCsToCSV(name=name, header=header)
         except Exception:
             traceback.print_exc()
